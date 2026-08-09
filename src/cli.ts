@@ -69,10 +69,12 @@ ${c.bold}Push Options:${c.reset}
   --from-sourcemap <file>   Push from sourcemap
   --no-place-config         Ignore push mappings from place ModuleScript
   --destructive             Wipe destination children before pushing
+  --missing-only            Create missing instances without changing existing instances
   --rojo                    Enable Rojo-compatible parsing
   --rojo-project <file>     Use a Rojo project file
 
 ${c.bold}Pack Options:${c.reset}
+  -s, --source <path>       Studio path to pack; repeat to include multiple roots
   -o, --output <file>       Sourcemap path to write (default: config.sourcemapPath)
   --scripts-only            Serialize only scripts and their descendants
 
@@ -225,16 +227,23 @@ if (parsedArgs.command === "build") {
 }
 
 if (parsedArgs.command === "push") {
+  if (parsedArgs.destructive && parsedArgs.missingOnly) {
+    throw new Error(
+      "--destructive and --missing-only cannot be used together.",
+    );
+  }
+
   const usePlaceConfig = !parsedArgs.noPlaceConfig;
 
   const hasPushSpecificOptions = Boolean(
     parsedArgs.source ||
-    parsedArgs.destination ||
-    parsedArgs.destructive ||
-    !usePlaceConfig ||
-    parsedArgs.rojo ||
-    parsedArgs.rojoProject ||
-    parsedArgs.fromSourcemap,
+      parsedArgs.destination ||
+      parsedArgs.destructive ||
+      parsedArgs.missingOnly ||
+      !usePlaceConfig ||
+      parsedArgs.rojo ||
+      parsedArgs.rojoProject ||
+      parsedArgs.fromSourcemap,
   );
 
   let interactiveSource = parsedArgs.source ?? undefined;
@@ -328,6 +337,7 @@ if (parsedArgs.command === "push") {
     source: interactiveSource ?? undefined,
     destination: interactiveDest ?? undefined,
     destructive: interactiveDestructive,
+    missingOnly: parsedArgs.missingOnly,
     usePlaceConfig: parsedArgs.rojo ? false : interactiveUsePlaceConfig,
     rojoMode: parsedArgs.rojo,
     rojoProjectFile: parsedArgs.rojoProject ?? undefined,
@@ -344,7 +354,10 @@ if (parsedArgs.command === "push") {
 if (parsedArgs.command === "pack") {
   let scriptsOnly = parsedArgs.scriptsOnly;
 
-  const hasPackSpecificOptions = parsedArgs.output !== undefined || scriptsOnly;
+  const hasPackSpecificOptions =
+    parsedArgs.output !== undefined ||
+    parsedArgs.packSources.length > 0 ||
+    scriptsOnly;
 
   let finalOutputPath = parsedArgs.output ?? config.sourcemapPath;
 
@@ -356,6 +369,7 @@ if (parsedArgs.command === "pack") {
 
   await new PackCommand({
     outputPath: finalOutputPath,
+    sources: parsedArgs.packSources,
     scriptsAndDescendantsOnly: scriptsOnly,
   }).run();
 

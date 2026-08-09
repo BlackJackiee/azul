@@ -7,7 +7,11 @@ import { log } from "./util/log.js";
 import { SnapshotBuilder } from "./snapshot.js";
 import { RojoSnapshotBuilder } from "./snapshot/rojo/index.js";
 import { generateGUID } from "./util/id.js";
-import { classifyScriptFileName, isInstanceJsonName, isScriptFileName } from "./util/scriptFile.js";
+import {
+  classifyScriptFileName,
+  isInstanceJsonName,
+  isScriptFileName,
+} from "./util/scriptFile.js";
 import {
   applySourcemapProperties,
   buildInstancesFromSourcemap,
@@ -27,6 +31,7 @@ interface PushOptions {
   source?: string;
   destination?: string;
   destructive?: boolean;
+  missingOnly?: boolean;
   usePlaceConfig?: boolean;
   rojoMode?: boolean;
   rojoProjectFile?: string;
@@ -81,22 +86,7 @@ export class PushCommand {
         },
       ];
 
-      await new Promise<void>((resolve) => {
-        const sendSnapshot = () => {
-          log.info("Handshake complete. Sending Rojo compatibility push...");
-          this.ipc.send({ type: "pushSnapshot", mappings: snapshotMappings });
-          setTimeout(() => {
-            this.ipc.close();
-            resolve();
-          }, 200);
-        };
-
-        this.ipc.onConnection(() => {
-          log.info("Studio connected. Waiting for handshake...");
-        });
-
-        this.ipc.onHandshake(sendSnapshot);
-      });
+      await this.sendPushSnapshot(snapshotMappings);
       return;
     }
 
@@ -142,6 +132,30 @@ export class PushCommand {
         continue;
       }
 
+      const mappingSourcemapPath = this.resolveMappingSourcemapPath(mapping);
+      if (mappingSourcemapPath) {
+        const instances = this.buildPushInstancesFromSourcemap(
+          mapping.source,
+          destSegments,
+          mappingSourcemapPath,
+        );
+        if (instances) {
+          snapshotMappings.push({
+            destination: destSegments,
+            destructive: Boolean(mapping.destructive),
+            instances,
+          });
+          log.success(
+            `Prepared ${instances.length} instances from ${mapping.source} -> ${destSegments.join("/")}`,
+          );
+          continue;
+        }
+
+        log.warn(
+          `Could not find sourcemap source path ${mapping.source}; trying the filesystem.`,
+        );
+      }
+
       const sourceCandidates = this.expandSourceCandidates(mapping.source);
       const sourcePath = sourceCandidates.find((candidate) =>
         fs.existsSync(candidate),
@@ -180,53 +194,14 @@ export class PushCommand {
         skipSymlinks: true,
       });
 
-      const mappingSourcemapPath = this.resolveMappingSourcemapPath(mapping);
-      const useFromSourcemap = Boolean(mappingSourcemapPath);
-
       if (isSourceDirectory) {
-        const instances = useFromSourcemap
-          ? this.buildPushInstancesFromSourcemap(
-              sourcePath,
-              destSegments,
-              mappingSourcemapPath!,
-            )
-          : isSourceDirectory
-            ? await builder.build()
-            : await this.buildPushInstancesFromFile(sourcePath, destSegments);
-
-        if (useFromSourcemap && !instances) {
-          log.warn(
-            `Could not derive sourcemap subtree for ${sourcePath}; falling back to filesystem snapshot.`,
-          );
-
-          const fallback = isSourceDirectory
-            ? await builder.build()
-            : await this.buildPushInstancesFromFile(sourcePath, destSegments);
-          if (!fallback) {
-            log.error(
-              `Could not build fallback snapshot for source path: ${sourcePath}`,
-            );
-            continue;
-          }
-          snapshotMappings.push({
-            destination: destSegments,
-            destructive: Boolean(mapping.destructive),
-            instances: fallback,
-          });
-          log.success(
-            `Prepared ${fallback.length} instances from ${sourcePath} -> ${destSegments.join("/")}`,
-          );
-          continue;
-        }
+        const instances = await builder.build();
 
         if (!instances) {
           continue;
         }
 
-        if (
-          !useFromSourcemap &&
-          this.options.applySourcemapProperties !== false
-        ) {
+        if (this.options.applySourcemapProperties !== false) {
           const sourcemapIndex = this.getSourcemapIndexForPath(
             this.sourcemapPath,
           );
@@ -264,10 +239,7 @@ export class PushCommand {
           instances: pushedFile,
         });
 
-        if (
-          !useFromSourcemap &&
-          this.options.applySourcemapProperties !== false
-        ) {
+        if (this.options.applySourcemapProperties !== false) {
           const sourcemapIndex = this.getSourcemapIndexForPath(
             this.sourcemapPath,
           );
@@ -282,21 +254,108 @@ export class PushCommand {
       return;
     }
 
+    await this.sendPushSnapshot(snapshotMappings);
+  }
+
+  private async sendPushSnapshot(
+    snapshotMappings: PushSnapshotMapping[],
+  ): Promise<void> {
     await new Promise<void>((resolve) => {
-      const sendSnapshot = () => {
-        log.info("Handshake complete. Sending push snapshot...");
-        this.ipc.send({ type: "pushSnapshot", mappings: snapshotMappings });
+      const sendSnapshot = (mappings: PushSnapshotMapping[]) => {
+        log.info("Sending push snapshot...");
+        this.ipc.send({ type: "pushSnapshot", mappings });
         setTimeout(() => {
           this.ipc.close();
           resolve();
         }, 200);
       };
 
+      if (this.options.missingOnly) {
+        this.ipc.onMessage((message) => {
+          if (message.type !== "fullSnapshot") return;
+          sendSnapshot(
+            this.filterExistingInstances(snapshotMappings, message.data),
+          );
+        });
+      }
+
       this.ipc.onConnection(() => {
         log.info("Studio connected. Waiting for handshake...");
       });
 
-      this.ipc.onHandshake(sendSnapshot);
+      this.ipc.onHandshake(() => {
+        log.info("Handshake complete.");
+        if (this.options.missingOnly) {
+          log.info("Reading existing Studio instances...");
+          this.ipc.requestSnapshot();
+        } else {
+          sendSnapshot(snapshotMappings);
+        }
+      });
+    });
+  }
+
+  private filterExistingInstances(
+    snapshotMappings: PushSnapshotMapping[],
+    existingInstances: InstanceData[],
+  ): PushSnapshotMapping[] {
+    const existingInstancesByPath = new Map<string, InstanceData[]>();
+    for (const existingInstance of existingInstances) {
+      const pathKey = existingInstance.path.join("\u0001");
+      const pathInstances = existingInstancesByPath.get(pathKey) ?? [];
+      pathInstances.push(existingInstance);
+      existingInstancesByPath.set(pathKey, pathInstances);
+    }
+
+    return snapshotMappings.map((snapshotMapping) => {
+      const sourcePathCounts = new Map<string, number>();
+      const conflictPaths = new Set<string>();
+      let preservedCount = 0;
+      let conflictCount = 0;
+
+      const instances = snapshotMapping.instances.filter((instance) => {
+        for (
+          let pathLength = 1;
+          pathLength < instance.path.length;
+          pathLength += 1
+        ) {
+          const ancestorPath = instance.path
+            .slice(0, pathLength)
+            .join("\u0001");
+          if (conflictPaths.has(ancestorPath)) {
+            preservedCount += 1;
+            return false;
+          }
+        }
+
+        const pathKey = instance.path.join("\u0001");
+        const sourcePathCount = (sourcePathCounts.get(pathKey) ?? 0) + 1;
+        sourcePathCounts.set(pathKey, sourcePathCount);
+
+        const existingInstance =
+          existingInstancesByPath.get(pathKey)?.[sourcePathCount - 1];
+        if (!existingInstance) return true;
+
+        preservedCount += 1;
+        if (existingInstance.className !== instance.className) {
+          conflictPaths.add(pathKey);
+          conflictCount += 1;
+          log.warn(
+            `Cannot add ${instance.path.join("/")} (${instance.className}) because an existing ${existingInstance.className} uses that path.`,
+          );
+        }
+        return false;
+      });
+
+      log.success(
+        `Prepared missing-only push for ${snapshotMapping.destination.join("/")}: ${instances.length} missing, ${preservedCount} preserved, ${conflictCount} conflicts.`,
+      );
+
+      return {
+        ...snapshotMapping,
+        destructive: false,
+        instances,
+      };
     });
   }
 
@@ -678,6 +737,16 @@ export class PushCommand {
     sourceDir: string,
     instances: InstanceData[],
   ): string[] | null {
+    const studioPath = this.parseDestination(sourceDir);
+    if (
+      studioPath.length > 0 &&
+      instances.some((instance) =>
+        this.pathStartsWith(instance.path, studioPath),
+      )
+    ) {
+      return studioPath;
+    }
+
     const normalized = path
       .resolve(sourceDir)
       .replace(/\\/g, "/")

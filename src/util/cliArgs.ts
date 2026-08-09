@@ -18,9 +18,11 @@ export interface ParsedCliArgs {
   fromSourcemap?: string;
   //   fromSourcemapValue: string | null;
   source?: string;
+  packSources: string[];
   destination?: string;
   noPlaceConfig: boolean;
   destructive: boolean;
+  missingOnly: boolean;
 
   //   Pack options
   output?: string;
@@ -54,6 +56,7 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
       destination: { type: "string", short: "d" },
       "no-place-config": { type: "boolean" },
       destructive: { type: "boolean" },
+      "missing-only": { type: "boolean" },
 
       // Pack options
       output: { type: "string", short: "o" },
@@ -89,12 +92,40 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     //     ? null
     //     : fromSourcemapRawValue,
     source: getStringOption(values, "source"),
+    packSources: getRepeatedStringOptions(argv, ["--source", "-s"]),
     destination: getStringOption(values, "destination"),
     noPlaceConfig: getBooleanOption(values, "no-place-config"),
     destructive: getBooleanOption(values, "destructive"),
+    missingOnly: getBooleanOption(values, "missing-only"),
     output: getStringOption(values, "output"),
     scriptsOnly: getBooleanOption(values, "scripts-only"),
   };
+}
+
+function getRepeatedStringOptions(argv: string[], flags: string[]): string[] {
+  const options: string[] = [];
+
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index];
+    const matchingFlag = flags.find(
+      (flag) => argument === flag || argument.startsWith(`${flag}=`),
+    );
+    if (!matchingFlag) continue;
+
+    if (argument.startsWith(`${matchingFlag}=`)) {
+      const value = argument.slice(matchingFlag.length + 1).trim();
+      if (value) options.push(value);
+      continue;
+    }
+
+    const value = argv[index + 1];
+    if (value && !value.startsWith("-")) {
+      options.push(value);
+      index += 1;
+    }
+  }
+
+  return options;
 }
 
 function getBooleanOption(

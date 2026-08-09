@@ -27,6 +27,22 @@ While Azul mainly follows this philosophy, it doesn't cut you off from the files
 - - [x] 🔴 **Rojo compatibility mode**: Supports importing from Rojo projects with the `--rojo` flag.
 - - [x] 🗺️ **Automatic sourcemap generation**: Generates a Rojo-compatible `sourcemap.json` so tools like Luau-lsp work out of the box.
 
+### Shared Studio assets
+
+Pack selected Studio trees into one sourcemap by repeating `--source`:
+
+```ps1
+azul pack --source ReplicatedStorage.Assets --source StarterGui.VFX --output framework-assets.json
+```
+
+Push a packed Studio path without requiring a matching filesystem folder:
+
+```ps1
+azul push --source ReplicatedStorage.Assets --destination ReplicatedStorage.Assets --from-sourcemap framework-assets.json --missing-only
+```
+
+`--missing-only` reads the target place before pushing, creates only missing Instances, preserves existing Instances and their properties, and reports incompatible path conflicts. It cannot be combined with `--destructive`.
+
 ## Why Azul?
 
 Because Azul is as simple as it gets: Run the `azul` command in your project folder, connect the companion plugin in Studio & start coding.

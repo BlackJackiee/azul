@@ -11,6 +11,7 @@ import type {
 
 interface PackOptions {
   outputPath?: string;
+  sources?: string[];
   scriptsAndDescendantsOnly?: boolean;
 }
 
@@ -32,7 +33,8 @@ interface SourcemapRoot {
   _azul?: {
     packVersion?: number;
     packedAt?: string;
-    mode?: "all" | "scripts-and-descendants";
+    mode?: "all" | "selected" | "scripts-and-descendants";
+    sources?: string[];
   };
 }
 
@@ -41,10 +43,17 @@ const PACK_VERSION = 1;
 export class PackCommand {
   private ipc: IPCServer;
   private outputPath: string;
+  private sourcePaths: string[][];
   private scriptsAndDescendantsOnly: boolean;
 
   constructor(options: PackOptions = {}) {
     this.outputPath = path.resolve(options.outputPath ?? config.sourcemapPath);
+    this.sourcePaths = (options.sources ?? []).map((source) =>
+      source
+        .split(/[./\\]+/)
+        .map((segment) => segment.trim())
+        .filter(Boolean),
+    );
     this.scriptsAndDescendantsOnly = Boolean(options.scriptsAndDescendantsOnly);
     this.ipc = new IPCServer(config.port, undefined, {
       requestSnapshotOnConnect: false,
@@ -63,12 +72,39 @@ export class PackCommand {
       return;
     }
 
+    const selectedSnapshot = this.selectSnapshotSources(snapshot);
+    if (!selectedSnapshot) return;
+
     const existing = this.readExistingSourcemap();
-    const regenerated = this.regenerateSourcemap(snapshot, existing);
-    const packedCount = this.packIntoSourcemap(snapshot, regenerated);
+    const regenerated = this.regenerateSourcemap(selectedSnapshot, existing);
+    const packedCount = this.packIntoSourcemap(selectedSnapshot, regenerated);
 
     this.writeSourcemap(regenerated, this.outputPath);
     log.success(`Packed ${packedCount} node(s) into ${this.outputPath}`);
+  }
+
+  private selectSnapshotSources(
+    snapshot: InstanceData[],
+  ): InstanceData[] | null {
+    if (this.sourcePaths.length === 0) return snapshot;
+
+    for (const sourcePath of this.sourcePaths) {
+      const sourceExists = snapshot.some((instance) =>
+        this.pathsEqual(instance.path, sourcePath),
+      );
+      if (!sourceExists) {
+        log.error(`Studio source path not found: ${sourcePath.join("/")}`);
+        return null;
+      }
+    }
+
+    return snapshot.filter((instance) =>
+      this.sourcePaths.some(
+        (sourcePath) =>
+          this.pathStartsWith(instance.path, sourcePath) ||
+          this.pathStartsWith(sourcePath, instance.path),
+      ),
+    );
   }
 
   private async requestSnapshot(
@@ -298,7 +334,15 @@ export class PackCommand {
     sourcemap._azul = {
       packVersion: PACK_VERSION,
       packedAt: new Date().toISOString(),
-      mode: this.scriptsAndDescendantsOnly ? "scripts-and-descendants" : "all",
+      mode: this.scriptsAndDescendantsOnly
+        ? "scripts-and-descendants"
+        : this.sourcePaths.length > 0
+          ? "selected"
+          : "all",
+      sources:
+        this.sourcePaths.length > 0
+          ? this.sourcePaths.map((sourcePath) => sourcePath.join("/"))
+          : undefined,
     };
 
     return packed;
@@ -319,5 +363,19 @@ export class PackCommand {
 
   private pathClassKey(pathSegments: string[], className: string): string {
     return `${pathSegments.join("\u0001")}::${className}`;
+  }
+
+  private pathsEqual(first: string[], second: string[]): boolean {
+    return (
+      first.length === second.length &&
+      first.every((segment, index) => segment === second[index])
+    );
+  }
+
+  private pathStartsWith(pathSegments: string[], prefix: string[]): boolean {
+    return (
+      pathSegments.length >= prefix.length &&
+      prefix.every((segment, index) => pathSegments[index] === segment)
+    );
   }
 }
