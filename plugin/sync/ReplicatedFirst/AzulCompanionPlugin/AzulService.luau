@@ -454,17 +454,18 @@ function AzulService.applySnapshotInstances(
 			parentPath[i] = adjustedPath[i]
 		end
 
-		-- Only use parent GUID resolution if there's no explicit destination override,
-		-- an explicit destination implies the user ran a push with a specific destination target.
-		local useParentGuidResolution = not destination or #destination == 0
+		-- A pushed snapshot comes from another Studio session, so its debug IDs must
+		-- never be matched against existing instances in this session. Source IDs are
+		-- still safe for linking parents created earlier in this same snapshot.
+		local isDestinationPush = destination ~= nil and #destination > 0
 		local parent: Instance? = nil
 		if
-			useParentGuidResolution
-			and type(item.parentGuid) == "string"
+			type(item.parentGuid) == "string"
 			and item.parentGuid ~= ""
 			and item.parentGuid ~= "root"
 		then
-			parent = resolvedInstancesByGuid[item.parentGuid] or existingInstancesByGuid[item.parentGuid]
+			parent = resolvedInstancesByGuid[item.parentGuid]
+			if not parent and not isDestinationPush then parent = existingInstancesByGuid[item.parentGuid] end
 		end
 		if not parent then parent = AzulService.getOrCreatePath(parentPath) end
 
@@ -503,7 +504,7 @@ function AzulService.applySnapshotInstances(
 		end
 
 		local existing: Instance? = nil
-		if type(item.guid) == "string" and item.guid ~= "" then
+		if not isDestinationPush and type(item.guid) == "string" and item.guid ~= "" then
 			existing = existingInstancesByGuid[item.guid]
 			if existing then
 				guidMatchCount += 1
