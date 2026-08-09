@@ -64,8 +64,8 @@ ${c.bold}Build Options:${c.reset}
   --rojo-project <file>     Use a Rojo project file
 
 ${c.bold}Push Options:${c.reset}
-  -s, --source <path>       Source file or folder to push
-  -d, --destination <path>  Studio destination path (i.e "ReplicatedStorage.Packages")
+  -s, --source <path>       Source to push; repeat with --destination for multiple mappings
+  -d, --destination <path>  Studio destination; repeat in the same order as --source
   --from-sourcemap <file>   Push from sourcemap
   --no-place-config         Ignore push mappings from place ModuleScript
   --destructive             Wipe destination children before pushing
@@ -234,6 +234,25 @@ if (parsedArgs.command === "push") {
   }
 
   const usePlaceConfig = !parsedArgs.noPlaceConfig;
+  const hasRepeatedPushMappings =
+    parsedArgs.packSources.length > 1 ||
+    parsedArgs.pushDestinations.length > 1;
+
+  if (
+    hasRepeatedPushMappings &&
+    parsedArgs.packSources.length !== parsedArgs.pushDestinations.length
+  ) {
+    throw new Error(
+      "Repeated --source and --destination arguments must have matching counts.",
+    );
+  }
+
+  const pushMappings = hasRepeatedPushMappings
+    ? parsedArgs.packSources.map((source, index) => ({
+        source,
+        destination: parsedArgs.pushDestinations[index],
+      }))
+    : undefined;
 
   const hasPushSpecificOptions = Boolean(
     parsedArgs.source ||
@@ -336,6 +355,7 @@ if (parsedArgs.command === "push") {
   await new PushCommand({
     source: interactiveSource ?? undefined,
     destination: interactiveDest ?? undefined,
+    mappings: pushMappings,
     destructive: interactiveDestructive,
     missingOnly: parsedArgs.missingOnly,
     usePlaceConfig: parsedArgs.rojo ? false : interactiveUsePlaceConfig,

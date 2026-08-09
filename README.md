@@ -41,6 +41,15 @@ Push a packed Studio path without requiring a matching filesystem folder:
 azul push --source ReplicatedStorage.Assets --destination ReplicatedStorage.Assets --from-sourcemap framework-assets.json --missing-only
 ```
 
+Repeat matching source and destination arguments to push several mappings in one Studio connection:
+
+```ps1
+azul push `
+  --source ReplicatedStorage.LegacyAssets --destination ReplicatedStorage.Assets `
+  --source StarterGui --destination StarterGui `
+  --from-sourcemap framework-assets.json --missing-only
+```
+
 `--missing-only` reads the target place before pushing, creates only missing Instances, preserves existing Instances and their properties, and reports incompatible path conflicts. It cannot be combined with `--destructive`.
 
 ## Why Azul?

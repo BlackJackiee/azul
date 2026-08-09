@@ -134,6 +134,60 @@ test("parseCliArgs retains repeated pack sources and missing-only", () => {
   assert.strictEqual(parsed.missingOnly, true);
 });
 
+test("parseCliArgs retains repeated push destinations", () => {
+  const parsed = parseCliArgs([
+    "push",
+    "--source",
+    "ReplicatedStorage.LegacyAssets",
+    "--destination",
+    "ReplicatedStorage.Assets",
+    "-s=StarterGui",
+    "-d=StarterGui",
+  ]);
+
+  assert.deepStrictEqual(parsed.packSources, [
+    "ReplicatedStorage.LegacyAssets",
+    "StarterGui",
+  ]);
+  assert.deepStrictEqual(parsed.pushDestinations, [
+    "ReplicatedStorage.Assets",
+    "StarterGui",
+  ]);
+});
+
+test("PushCommand accepts multiple explicit mappings", async () => {
+  const push = new PushCommand({
+    mappings: [
+      {
+        source: "ReplicatedStorage.LegacyAssets",
+        destination: "ReplicatedStorage.Assets",
+      },
+      {
+        source: "StarterGui",
+        destination: "StarterGui",
+      },
+    ],
+  });
+
+  try {
+    const mappings = await (push as any).collectMappings();
+    assert.deepStrictEqual(mappings, [
+      {
+        source: "ReplicatedStorage.LegacyAssets",
+        destination: ["ReplicatedStorage", "Assets"],
+        destructive: false,
+      },
+      {
+        source: "StarterGui",
+        destination: ["StarterGui"],
+        destructive: false,
+      },
+    ]);
+  } finally {
+    (push as any).ipc.close();
+  }
+});
+
 test("PushCommand reads a Studio source path directly from a sourcemap", () => {
   const temporaryDirectory = fs.mkdtempSync(
     path.join(os.tmpdir(), "azul-push-test-"),

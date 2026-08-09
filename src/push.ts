@@ -30,6 +30,10 @@ import type {
 interface PushOptions {
   source?: string;
   destination?: string;
+  mappings?: Array<{
+    source: string;
+    destination: string;
+  }>;
   destructive?: boolean;
   missingOnly?: boolean;
   usePlaceConfig?: boolean;
@@ -586,6 +590,28 @@ export class PushCommand {
    * @returns
    */
   private async collectMappings(): Promise<PushConfig["mappings"] | null> {
+    if (this.options.mappings && this.options.mappings.length > 0) {
+      const mappings: PushConfig["mappings"] = [];
+
+      for (const mapping of this.options.mappings) {
+        const destination = this.parseDestination(mapping.destination);
+        if (destination.length === 0) {
+          log.error(
+            "Destination must be a dot-separated path (e.g., ReplicatedStorage.Packages)",
+          );
+          return null;
+        }
+
+        mappings.push({
+          source: mapping.source,
+          destination,
+          destructive: Boolean(this.options.destructive),
+        });
+      }
+
+      return mappings;
+    }
+
     // CLI-provided mapping takes priority
     if (this.options.source && this.options.destination) {
       const destSegments = this.parseDestination(this.options.destination);

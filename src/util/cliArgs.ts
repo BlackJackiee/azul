@@ -20,6 +20,7 @@ export interface ParsedCliArgs {
   source?: string;
   packSources: string[];
   destination?: string;
+  pushDestinations: string[];
   noPlaceConfig: boolean;
   destructive: boolean;
   missingOnly: boolean;
@@ -94,6 +95,10 @@ export function parseCliArgs(argv: string[]): ParsedCliArgs {
     source: getStringOption(values, "source"),
     packSources: getRepeatedStringOptions(argv, ["--source", "-s"]),
     destination: getStringOption(values, "destination"),
+    pushDestinations: getRepeatedStringOptions(argv, [
+      "--destination",
+      "-d",
+    ]),
     noPlaceConfig: getBooleanOption(values, "no-place-config"),
     destructive: getBooleanOption(values, "destructive"),
     missingOnly: getBooleanOption(values, "missing-only"),
