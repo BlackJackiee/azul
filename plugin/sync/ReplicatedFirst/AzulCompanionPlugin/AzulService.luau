@@ -1,6 +1,6 @@
 --!strict
 local AzulService = {}
-AzulService.VERSION = 45
+AzulService.VERSION = 46
 
 -- Services
 local ScriptEditorService = game:GetService("ScriptEditorService")
@@ -207,7 +207,7 @@ function AzulService.instanceToData(
 		})
 		if next(properties) ~= nil then data.properties = properties end
 
-		local attributes = instance:GetAttributes()
+		local attributes = Serializer.collectSerializedAttributes(instance)
 		if next(attributes) ~= nil then data.attributes = attributes end
 
 		local tags = Serializer.collectSerializedTags(instance)
@@ -395,7 +395,16 @@ function AzulService.applySnapshotInstances(
 	local existingInstancesByGuid: { [string]: Instance } = {}
 	local initialStudioGuids: { [string]: boolean } = {}
 	local resolvedInstancesByGuid: { [string]: Instance } = {}
-	local deferredPropertyApplications: { { instance: Instance, properties: { [string]: any }? } } = {}
+	local createdInstances = {} :: { [Instance]: boolean }
+	local pendingRootAttachments = {} :: { { instance: Instance, parent: Instance } }
+	local deferredApplications = {} :: {
+		{
+			instance: Instance,
+			properties: { [string]: any }?,
+			attributes: { [string]: any }?,
+			tags: { string }?,
+		}
+	}
 
 	local lockedContainerParents = {
 		StarterPlayerScripts = "StarterPlayer",
@@ -601,7 +610,15 @@ function AzulService.applySnapshotInstances(
 				end
 			end
 			newInstance.Name = adjustedPath[#adjustedPath]
-			newInstance.Parent = parent :: Instance
+			createdInstances[newInstance] = true
+			if parent and createdInstances[parent] then
+				newInstance.Parent = parent
+			elseif parent then
+				table.insert(pendingRootAttachments, {
+					instance = newInstance,
+					parent = parent,
+				})
+			end
 			instance = newInstance
 			created += 1
 		else
@@ -634,13 +651,12 @@ function AzulService.applySnapshotInstances(
 			local propertiesForApply = item.properties
 			if instance:IsA("MeshPart") then propertiesForApply = stripMeshId(propertiesForApply) end
 
-			table.insert(deferredPropertyApplications, {
+			table.insert(deferredApplications, {
 				instance = instance,
 				properties = propertiesForApply,
+				attributes = item.attributes,
+				tags = item.tags,
 			})
-
-			Serializer.applySerializedAttributes(instance, item.attributes)
-			Serializer.applySerializedTags(instance, item.tags)
 		end
 
 		if AzulService.isScriptClass(item.className) and item.source and instance then
@@ -655,13 +671,22 @@ function AzulService.applySnapshotInstances(
 		end
 	end
 
-	for _, pending in ipairs(deferredPropertyApplications) do
+	for _, pending in ipairs(deferredApplications) do
 		Serializer.applySerializedProperties(pending.instance, pending.properties, {
 			resolveInstanceByGuid = function(guid: string): Instance? return resolvedInstancesByGuid[guid] end,
 			resolveInstanceByPath = function(pathSegments: { string }): Instance?
 				return findInstanceByPath(pathSegments)
 			end,
 		})
+		Serializer.applySerializedAttributes(pending.instance, pending.attributes)
+	end
+
+	for _, pendingAttachment in ipairs(pendingRootAttachments) do
+		pendingAttachment.instance.Parent = pendingAttachment.parent
+	end
+
+	for _, pending in ipairs(deferredApplications) do
+		Serializer.applySerializedTags(pending.instance, pending.tags)
 	end
 
 	debugPrint(

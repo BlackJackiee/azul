@@ -921,6 +921,17 @@ function Serializer.applySerializedProperties(
 	end
 end
 
+function Serializer.collectSerializedAttributes(instance: Instance): { [string]: any }
+	local serializedAttributes = {}
+	for attributeName, attributeValue in pairs(instance:GetAttributes()) do
+		local serializedAttributeValue = Serializer.serializeValue(attributeValue)
+		if serializedAttributeValue ~= nil then
+			serializedAttributes[attributeName] = serializedAttributeValue
+		end
+	end
+	return serializedAttributes
+end
+
 --[=[
 	Applies serialized attributes to an instance by calling SetAttribute for each key-value pair in the attributes table.
 	@param instance Instance - The instance to apply attributes to
@@ -929,8 +940,11 @@ end
 function Serializer.applySerializedAttributes(instance: Instance, attributes: { [string]: any }?)
 	if type(attributes) ~= "table" then return end
 
-	for key, value in pairs(attributes) do
-		pcall(function() instance:SetAttribute(key, value) end)
+	for attributeName, serializedAttributeValue in pairs(attributes) do
+		local attributeValue = Serializer.deserializeValue(serializedAttributeValue)
+		if attributeValue ~= nil then
+			pcall(function() instance:SetAttribute(attributeName, attributeValue) end)
+		end
 	end
 end
 
