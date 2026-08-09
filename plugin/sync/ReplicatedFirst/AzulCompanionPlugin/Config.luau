@@ -30,7 +30,7 @@ configTable = {
 		"Workspace.Surface Converter Storage", -- Folder managed by "Surface Converter" plugin. We don't need to track it.
 	},
 
-	AUTO_CONNECT = true,
+	AUTO_CONNECT = false,
 	DEBUG_MODE = false,
 	SILENT_MODE = false,
 }
