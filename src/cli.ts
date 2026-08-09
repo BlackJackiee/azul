@@ -25,7 +25,7 @@ try {
 initializeConfig();
 log.debug(`Loaded user config from: ${getUserConfigPath()}`);
 
-if (config.checkForUpdates) {
+if (config.checkForUpdates && !versionCurrent.includes("-ato.")) {
   void checkForUpdates(versionCurrent);
 }
 
