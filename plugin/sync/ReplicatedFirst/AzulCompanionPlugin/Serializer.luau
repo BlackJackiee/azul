@@ -117,6 +117,33 @@ local writablePropertiesByClass: { [string]: { [string]: boolean } } = {}
 local defaultSerializedPropertiesByClass: { [string]: { [string]: any } } = {}
 local canonicalPropertyByLowerByClass: { [string]: { [string]: string } } = {}
 
+-- Roblox exposes several writable properties that describe the same underlying
+-- value. Apply the derived/legacy forms first and the canonical authored form
+-- last so table iteration order cannot change the imported result.
+local PROPERTY_APPLICATION_PRIORITY: { [string]: number } = {
+	WorldCFrame = -20,
+	WorldPosition = -20,
+	WorldOrientation = -20,
+	WorldAxis = -20,
+	WorldSecondaryAxis = -20,
+	Position = -10,
+	Orientation = -10,
+	Rotation = -10,
+	Axis = -10,
+	SecondaryAxis = -10,
+	BrickColor = -10,
+	brickColor = -10,
+	BackgroundColor = -10,
+	BorderColor = -10,
+	TextColor = -10,
+	CFrame = 10,
+	Color = 10,
+	BackgroundColor3 = 10,
+	BorderColor3 = 10,
+	TextColor3 = 10,
+	SpreadAngle = 10,
+}
+
 local function enumItemFromNumber(enumItems: { any }, value: number): any
 	for _, item in ipairs(enumItems) do
 		if item.Value == value then return item end
@@ -905,7 +932,19 @@ function Serializer.applySerializedProperties(
 )
 	if type(properties) ~= "table" then return end
 
-	for propertyName, serialized in pairs(properties) do
+	local propertyNames = {}
+	for propertyName in pairs(properties) do
+		table.insert(propertyNames, propertyName)
+	end
+	table.sort(propertyNames, function(firstPropertyName, secondPropertyName)
+		local firstPriority = PROPERTY_APPLICATION_PRIORITY[firstPropertyName] or 0
+		local secondPriority = PROPERTY_APPLICATION_PRIORITY[secondPropertyName] or 0
+		if firstPriority ~= secondPriority then return firstPriority < secondPriority end
+		return firstPropertyName < secondPropertyName
+	end)
+
+	for _, propertyName in propertyNames do
+		local serialized = properties[propertyName]
 		if propertyName ~= "Name" and propertyName ~= "Parent" and propertyName ~= "Source" then
 			local targetPropertyName = propertyName
 			if propertyName == "Transparency" and instance:IsA("GuiObject") then
