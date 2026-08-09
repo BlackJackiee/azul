@@ -68,7 +68,7 @@ export class PushCommand {
     });
   }
 
-  public async run(): Promise<void> {
+  public async run(): Promise<boolean> {
     if (this.options.rojoMode) {
       log.info(
         "Rojo compatibility mode: ignoring place config; destination becomes a prefix.",
@@ -80,7 +80,7 @@ export class PushCommand {
         destSegments,
         this.options.source,
       );
-      if (!instances) return;
+      if (!instances) return false;
 
       const snapshotMappings: PushSnapshotMapping[] = [
         {
@@ -90,8 +90,7 @@ export class PushCommand {
         },
       ];
 
-      await this.sendPushSnapshot(snapshotMappings);
-      return;
+      return this.sendPushSnapshot(snapshotMappings);
     }
 
     const mappings = await this.collectMappings();
@@ -99,7 +98,7 @@ export class PushCommand {
       log.error(
         "No push mappings available. Provide '--source' / '--destination' or place config.",
       );
-      return;
+      return false;
     }
 
     log.info(`Building ${mappings.length} mapping(s) for push...`);
@@ -255,24 +254,36 @@ export class PushCommand {
 
     if (snapshotMappings.length === 0) {
       log.error("No push mappings could be prepared (missing source paths).");
-      return;
+      return false;
     }
 
-    await this.sendPushSnapshot(snapshotMappings);
+    return this.sendPushSnapshot(snapshotMappings);
   }
 
   private async sendPushSnapshot(
     snapshotMappings: PushSnapshotMapping[],
-  ): Promise<void> {
-    await new Promise<void>((resolve) => {
+  ): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      let isFinished = false;
+      const finish = (wasSent: boolean) => {
+        if (isFinished) return;
+        isFinished = true;
+        clearTimeout(timeoutHandle);
+        this.ipc.close();
+        resolve(wasSent);
+      };
       const sendSnapshot = (mappings: PushSnapshotMapping[]) => {
+        if (isFinished) return;
         log.info("Sending push snapshot...");
         this.ipc.send({ type: "pushSnapshot", mappings });
         setTimeout(() => {
-          this.ipc.close();
-          resolve();
+          finish(true);
         }, 200);
       };
+      const timeoutHandle = setTimeout(() => {
+        log.error("Timed out waiting for Studio to connect and accept the push.");
+        finish(false);
+      }, 30000);
 
       if (this.options.missingOnly) {
         this.ipc.onMessage((message) => {

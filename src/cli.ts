@@ -352,7 +352,7 @@ if (parsedArgs.command === "push") {
     }
   }
 
-  await new PushCommand({
+  const wasPushSent = await new PushCommand({
     source: interactiveSource ?? undefined,
     destination: interactiveDest ?? undefined,
     mappings: pushMappings,
@@ -365,6 +365,10 @@ if (parsedArgs.command === "push") {
     useSourcemapAsSource,
     sourcemapPath: parsedArgs.fromSourcemap,
   }).run();
+
+  if (!wasPushSent) {
+    process.exit(1);
+  }
 
   log.info("Push command completed.");
   log.info("Run 'azul' to resume live sync if needed.");
@@ -387,11 +391,15 @@ if (parsedArgs.command === "pack") {
     scriptsOnly = interactive.scriptsOnly;
   }
 
-  await new PackCommand({
+  const wasPacked = await new PackCommand({
     outputPath: finalOutputPath,
     sources: parsedArgs.packSources,
     scriptsAndDescendantsOnly: scriptsOnly,
   }).run();
+
+  if (!wasPacked) {
+    process.exit(1);
+  }
 
   log.info("Pack command completed.");
   process.exit(0);

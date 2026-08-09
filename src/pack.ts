@@ -60,7 +60,7 @@ export class PackCommand {
     });
   }
 
-  public async run(): Promise<void> {
+  public async run(): Promise<boolean> {
     log.info(`Waiting for Studio to connect on port ${config.port}...`);
     const snapshot = await this.requestSnapshot({
       includeProperties: true,
@@ -69,11 +69,11 @@ export class PackCommand {
 
     if (!snapshot) {
       log.error("Failed to receive snapshot from Studio for packing.");
-      return;
+      return false;
     }
 
     const selectedSnapshot = this.selectSnapshotSources(snapshot);
-    if (!selectedSnapshot) return;
+    if (!selectedSnapshot) return false;
 
     const existing = this.readExistingSourcemap();
     const regenerated = this.regenerateSourcemap(selectedSnapshot, existing);
@@ -81,6 +81,7 @@ export class PackCommand {
 
     this.writeSourcemap(regenerated, this.outputPath);
     log.success(`Packed ${packedCount} node(s) into ${this.outputPath}`);
+    return true;
   }
 
   private selectSnapshotSources(
