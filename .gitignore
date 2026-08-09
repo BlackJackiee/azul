@@ -1,4 +1,5 @@
 node_modules/
+plugin/AzulCompanionPlugin.rbxmx
 *.log
 .DS_Store
 sourcemap.json
