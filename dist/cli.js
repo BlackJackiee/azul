@@ -1,0 +1,379 @@
+#!/usr/bin/env node
+import { resolve } from "node:path";
+import fs from "node:fs";
+import { spawn } from "node:child_process";
+import { SyncDaemon } from "./index.js"; // or refactor to export the class
+import { config, getUserConfigPath, initializeConfig } from "./config.js";
+import { log } from "./util/log.js";
+import { BuildCommand } from "./build.js";
+import { PushCommand } from "./push.js";
+import { PackCommand } from "./pack.js";
+import { parseCliArgs } from "./util/cliArgs.js";
+import { getCurrentVersion, getLatestVersion } from "./util/versionUtils.js";
+import { prompt } from "./util/prompt.js";
+const versionCurrent = getCurrentVersion();
+let parsedArgs;
+try {
+    parsedArgs = parseCliArgs(process.argv.slice(2));
+}
+catch (error) {
+    log.error(`${error}`);
+    process.exit(1);
+}
+initializeConfig();
+log.debug(`Loaded user config from: ${getUserConfigPath()}`);
+if (config.checkForUpdates && !versionCurrent.includes("-ato.")) {
+    void checkForUpdates(versionCurrent);
+}
+const c = {
+    reset: "\x1b[0m",
+    dim: "\x1b[2m",
+    cyan: "\x1b[36m",
+    underline: "\x1b[4m",
+    bold: "\x1b[1m",
+};
+if (parsedArgs.help) {
+    console.log(`
+${c.bold}Usage:${c.reset}
+  ${c.cyan}azul <command> [options]${c.reset}
+
+${c.bold}Commands:${c.reset} 
+  ${c.bold}(no command)${c.reset}              Start live sync daemon
+  ${c.bold}build${c.reset}                     One-time push from filesystem into Studio
+  ${c.bold}push${c.reset}                      Selective push using mappings (place config or -s/-d)
+  ${c.bold}pack${c.reset}                      Serialize Studio instance properties into sourcemap.json
+  ${c.bold}config${c.reset}                    Open the Azul config file in your default editor
+
+${c.bold}Global Options:${c.reset}
+  -h, --help                Show this help message
+  --version                 Show Azul version
+  --debug                   Print verbose debug output
+  --no-warn                 Disable confirmation prompts for dangerous operations
+  --sync-dir <path>         Directory to sync (default: current directory)
+  --port <number>           Studio connection port
+
+${c.bold}Build Options:${c.reset}
+  --from-sourcemap <file>   Build from sourcemap
+  --destructive             Wipe destination children for build roots before applying snapshot
+  --rojo                    Enable Rojo-compatible parsing
+  --rojo-project <file>     Use a Rojo project file
+
+${c.bold}Push Options:${c.reset}
+  -s, --source <path>       Source to push; repeat with --destination for multiple mappings
+  -d, --destination <path>  Studio destination; repeat in the same order as --source
+  --from-sourcemap <file>   Push from sourcemap
+  --no-place-config         Ignore push mappings from place ModuleScript
+  --destructive             Wipe destination children before pushing
+  --missing-only            Create missing instances without changing existing instances
+  --rojo                    Enable Rojo-compatible parsing
+  --rojo-project <file>     Use a Rojo project file
+
+${c.bold}Pack Options:${c.reset}
+  -s, --source <path>       Studio path to pack; repeat to include multiple roots
+  -o, --output <file>       Sourcemap path to write (default: config.sourcemapPath)
+  --scripts-only            Serialize only scripts and their descendants
+
+${c.bold}Config Options:${c.reset}
+  --path                    Print config file path
+  `);
+    process.exit(0);
+}
+if (parsedArgs.version) {
+    log.info(`Azul version: ${versionCurrent}`);
+    process.exit(0);
+}
+if (parsedArgs.command === "config") {
+    const userConfigPath = getUserConfigPath();
+    if (parsedArgs.configPath) {
+        console.log(userConfigPath);
+        process.exit(0);
+    }
+    try {
+        await openWithDefaultEditor(userConfigPath);
+        log.info(`Opened Azul config: ${userConfigPath}`);
+    }
+    catch (error) {
+        throw new Error(`Failed to open config file: ${error}`);
+    }
+    process.exit(0);
+}
+// get current running path
+const currentPath = process.cwd();
+if ((currentPath.includes(`\\${config.syncDir}`) ||
+    currentPath.includes(`/${config.syncDir}`)) &&
+    !parsedArgs.noWarn) {
+    log.warn(`Looks like you're trying to run Azul from within a '${config.syncDir}' directory. Running Azul here will create a directory like "/${config.syncDir}/${config.syncDir}/", which may be unintended.`);
+    const continueFromSyncDir = await prompt.getYesNoInput("Continue? (Y/N)", "Please answer Y (yes) or N (no). Are you sure? (Y/N)");
+    if (!continueFromSyncDir) {
+        log.info("Exiting. Please run azul from your project root.");
+        process.exit(0);
+    }
+}
+log.info(`Running azul from: ${currentPath}`);
+if (parsedArgs.syncDir)
+    config.syncDir = resolve(parsedArgs.syncDir);
+if (parsedArgs.port)
+    config.port = parsedArgs.port;
+if (parsedArgs.debug)
+    config.debugMode = true;
+log.debug(`Debug mode is on!`);
+if (parsedArgs.command === "build") {
+    if (!parsedArgs.rojo && fs.existsSync("default.project.json")) {
+        log.warn('Detected a default.project.json file! You can enable Rojo compatibility mode by passing the "--rojo" flag.');
+    }
+    const hasBuildSpecificOptions = parsedArgs.rojo ||
+        Boolean(parsedArgs.rojoProject) ||
+        parsedArgs.fromSourcemap !== undefined;
+    // || parsedArgs.destructive;
+    // Don't consider passing "--destructive" as enough to bypass interactive mode,
+    // since destructive building without a sourcemap is very likely a mistake.
+    let applySourcemapProperties = true;
+    let useSourcemapAsSource = parsedArgs.fromSourcemap !== undefined;
+    let interactiveDestructive = parsedArgs.destructive;
+    if (!hasBuildSpecificOptions) {
+        const sourcemapExists = fs.existsSync(config.sourcemapPath);
+        if (sourcemapExists) {
+            const useFull = await prompt.getYesNoInput(`Build directly from ${config.sourcemapPath} (includes non-script instances)? (Y/N)`);
+            if (useFull) {
+                useSourcemapAsSource = true;
+                applySourcemapProperties = false;
+            }
+            else {
+                applySourcemapProperties = await prompt.getYesNoInput(`Use packed properties/attributes from ${config.sourcemapPath}? (Y/N)`);
+            }
+        }
+        else {
+            applySourcemapProperties = false;
+            log.info(`No sourcemap found at ${config.sourcemapPath}. Build will recreate instances as scripts/folders.`);
+        }
+        // Only ask about destructive option if we're building from sourcemap.
+        // Destructively building without a sourcemap is very likely a mistake, since it wipes everything in Studio instead of building "on top".
+        // This functionality is still possible with the "--destructive" flag if someone really wants it
+        if (useSourcemapAsSource || applySourcemapProperties) {
+            interactiveDestructive = await prompt.getYesNoInput("Destructive build (wipe everything in Studio & build from scratch)? (Y/N)");
+        }
+    }
+    if (!parsedArgs.noWarn) {
+        if (interactiveDestructive) {
+            log.warn("CAUTION: This will replace your entire Studio state with your local project (all instances, scripts, and properties). Unsaved Studio work WILL BE LOST.");
+        }
+        else {
+            log.warn("CAUTION: This will overwrite matching Studio scripts/instances and create new ones from your local project. Instances with no local equivalent will be left untouched.");
+        }
+        const shouldContinue = await prompt.getYesNoInput("Continue with build? (Y/N)", "Please answer Y (yes) or N (no). Continue with build? (Y/N)");
+        if (!shouldContinue) {
+            log.info("Exiting build command...");
+            process.exit(0);
+        }
+    }
+    await new BuildCommand({
+        syncDir: config.syncDir,
+        rojoMode: parsedArgs.rojo,
+        rojoProjectFile: parsedArgs.rojoProject ?? undefined,
+        applySourcemapProperties,
+        useSourcemapAsSource,
+        sourcemapPath: parsedArgs.fromSourcemap,
+        destructive: interactiveDestructive,
+    }).run();
+    log.info("Build command completed.");
+    log.info("Run 'azul' to resume live sync if needed.");
+    log.info("Exiting...");
+    process.exit(0);
+}
+if (parsedArgs.command === "push") {
+    if (parsedArgs.destructive && parsedArgs.missingOnly) {
+        throw new Error("--destructive and --missing-only cannot be used together.");
+    }
+    const usePlaceConfig = !parsedArgs.noPlaceConfig;
+    const hasRepeatedPushMappings = parsedArgs.packSources.length > 1 ||
+        parsedArgs.pushDestinations.length > 1;
+    if (hasRepeatedPushMappings &&
+        parsedArgs.packSources.length !== parsedArgs.pushDestinations.length) {
+        throw new Error("Repeated --source and --destination arguments must have matching counts.");
+    }
+    const pushMappings = hasRepeatedPushMappings
+        ? parsedArgs.packSources.map((source, index) => ({
+            source,
+            destination: parsedArgs.pushDestinations[index],
+        }))
+        : undefined;
+    const hasPushSpecificOptions = Boolean(parsedArgs.source ||
+        parsedArgs.destination ||
+        parsedArgs.destructive ||
+        parsedArgs.missingOnly ||
+        !usePlaceConfig ||
+        parsedArgs.rojo ||
+        parsedArgs.rojoProject ||
+        parsedArgs.fromSourcemap);
+    let interactiveSource = parsedArgs.source ?? undefined;
+    let interactiveDest = parsedArgs.destination ?? undefined;
+    let interactiveDestructive = parsedArgs.destructive;
+    let interactiveUsePlaceConfig = usePlaceConfig;
+    let useSourcemapAsSource = !parsedArgs.rojo && parsedArgs.fromSourcemap !== undefined;
+    let applySourcemapProperties = !parsedArgs.rojo && parsedArgs.fromSourcemap === undefined;
+    if (!hasPushSpecificOptions && !parsedArgs.rojo) {
+        const useConfig = await prompt.getYesNoInput("Use place config from Studio (ServerStorage.Azul.Config)? (Y/N)");
+        interactiveUsePlaceConfig = useConfig;
+        if (!useConfig) {
+            interactiveSource =
+                (await prompt.getInput("Source folder to push (e.g., src)?")).trim() ||
+                    undefined;
+            interactiveDest =
+                (await prompt.getInput("Destination path (dot or slash separated, e.g., ReplicatedStorage.Packages)?")).trim() || undefined;
+            interactiveDestructive = await prompt.getYesNoInput("Destructive push (wipe destination children)? (Y/N)");
+        }
+    }
+    const willUsePlaceConfig = !parsedArgs.rojo &&
+        interactiveUsePlaceConfig &&
+        !(interactiveSource && interactiveDest);
+    if (!parsedArgs.rojo &&
+        parsedArgs.fromSourcemap === undefined &&
+        !willUsePlaceConfig) {
+        useSourcemapAsSource = await prompt.getYesNoInput(`Build push snapshot directly from ${config.sourcemapPath} (includes non-script descendants and ancestors)? (Y/N)`);
+        if (useSourcemapAsSource) {
+            if (fs.existsSync(config.sourcemapPath)) {
+                applySourcemapProperties = await prompt.getYesNoInput(`Apply packed properties/attributes from ${config.sourcemapPath}? (Y/N)`);
+            }
+            else {
+                useSourcemapAsSource = false;
+                applySourcemapProperties = false;
+                throw new Error(`Sourcemap not found at "${config.sourcemapPath}"! Please create one or provide it using the "--from-sourcemap" flag.`);
+            }
+        }
+        else {
+            useSourcemapAsSource = false;
+            applySourcemapProperties = false;
+            log.info(`Not using sourcemap. Azul will recreate instances as scripts/folders based on your local filesystem structure with default Properties/Attributes.`);
+        }
+    }
+    if (!parsedArgs.rojo && fs.existsSync("default.project.json")) {
+        log.info("Detected default.project.json. Azul stays in native mode unless you pass --rojo.");
+    }
+    if (parsedArgs.destructive && !parsedArgs.noWarn) {
+        log.warn("CAUTION: Destructive push will wipe destination children before applying snapshot. Proceed? (Y/N)");
+        const shouldContinue = await prompt.getYesNoInput("Continue with destructive push? (Y/N)", "Please answer Y (yes) or N (no). Continue with destructive push? (Y/N)");
+        if (!shouldContinue) {
+            log.info("Exiting push command...");
+            process.exit(0);
+        }
+    }
+    const wasPushSent = await new PushCommand({
+        source: interactiveSource ?? undefined,
+        destination: interactiveDest ?? undefined,
+        mappings: pushMappings,
+        destructive: interactiveDestructive,
+        missingOnly: parsedArgs.missingOnly,
+        usePlaceConfig: parsedArgs.rojo ? false : interactiveUsePlaceConfig,
+        rojoMode: parsedArgs.rojo,
+        rojoProjectFile: parsedArgs.rojoProject ?? undefined,
+        applySourcemapProperties,
+        useSourcemapAsSource,
+        sourcemapPath: parsedArgs.fromSourcemap,
+    }).run();
+    if (!wasPushSent) {
+        process.exit(1);
+    }
+    log.info("Push command completed.");
+    log.info("Run 'azul' to resume live sync if needed.");
+    process.exit(0);
+}
+if (parsedArgs.command === "pack") {
+    let scriptsOnly = parsedArgs.scriptsOnly;
+    const hasPackSpecificOptions = parsedArgs.output !== undefined ||
+        parsedArgs.packSources.length > 0 ||
+        scriptsOnly;
+    let finalOutputPath = parsedArgs.output ?? config.sourcemapPath;
+    if (!hasPackSpecificOptions) {
+        const interactive = await promptPackInteractive(config.sourcemapPath);
+        finalOutputPath = interactive.outputPath;
+        scriptsOnly = interactive.scriptsOnly;
+    }
+    const wasPacked = await new PackCommand({
+        outputPath: finalOutputPath,
+        sources: parsedArgs.packSources,
+        scriptsAndDescendantsOnly: scriptsOnly,
+    }).run();
+    if (!wasPacked) {
+        process.exit(1);
+    }
+    log.info("Pack command completed.");
+    process.exit(0);
+}
+const liveDaemon = new SyncDaemon();
+liveDaemon.start();
+let liveDaemonStopping = false;
+const stopLiveDaemon = async (signal) => {
+    if (liveDaemonStopping) {
+        return;
+    }
+    liveDaemonStopping = true;
+    log.info(`Received ${signal}, shutting down...`);
+    try {
+        await liveDaemon.stop();
+        process.exit(0);
+    }
+    catch (error) {
+        throw new Error(`Failed to stop daemon cleanly: ${error}`);
+    }
+};
+process.on("SIGINT", () => {
+    void stopLiveDaemon("SIGINT");
+});
+process.on("SIGTERM", () => {
+    void stopLiveDaemon("SIGTERM");
+});
+async function checkForUpdates(currentVersion) {
+    log.debug("Checking for updates...");
+    const latest = await getLatestVersion();
+    if (latest && latest !== currentVersion) {
+        log.warn(`A new version of Azul is available! (${currentVersion} -> ${latest})`);
+    }
+}
+function openWithDefaultEditor(targetPath) {
+    return new Promise((resolvePromise, rejectPromise) => {
+        const currentPlatform = process.platform;
+        const argsByPlatform = {
+            win32: ["/c", "start", "", targetPath],
+            darwin: [targetPath],
+            linux: [targetPath],
+        };
+        const commandByPlatform = {
+            win32: "cmd",
+            darwin: "open",
+            linux: "xdg-open",
+        };
+        const commandName = commandByPlatform[currentPlatform];
+        const commandArgs = argsByPlatform[currentPlatform];
+        if (!commandName || !commandArgs) {
+            rejectPromise(new Error(`Unsupported platform: ${currentPlatform}`));
+            return;
+        }
+        const child = spawn(commandName, commandArgs, {
+            detached: true,
+            stdio: "ignore",
+        });
+        child.on("error", (error) => {
+            if (currentPlatform === "linux" && error.code === "ENOENT") {
+                rejectPromise(new Error("Could not open config file because 'xdg-open' is not installed. Install it (i.e: 'sudo apt install xdg-utils' or 'sudo dnf install xdg-utils') and try again."));
+                return;
+            }
+            rejectPromise(error);
+        });
+        child.unref();
+        resolvePromise();
+    });
+}
+async function promptPackInteractive(defaultOutputPath) {
+    log.info("Interactive mode: configuring 'azul pack'.");
+    const scriptsOnly = !(await prompt.getYesNoInput("Serialize everything? (Y/N)"));
+    if (scriptsOnly) {
+        log.info("Scripts-only mode will only serialize Script, LocalScript, and ModuleScript instances and their descendants.");
+    }
+    const outputInput = await prompt.getInput(`Output sourcemap path? (press Enter for '${defaultOutputPath}')`);
+    const outputPath = outputInput.trim() === "" ? defaultOutputPath : outputInput.trim();
+    return {
+        outputPath,
+        scriptsOnly,
+    };
+}
+//# sourceMappingURL=cli.js.map

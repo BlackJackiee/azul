@@ -1,0 +1,386 @@
+import path from "node:path";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
+import * as http from "http";
+import { IPCServer } from "./ipc/server.js";
+import { TreeManager } from "./fs/treeManager.js";
+import { FileWriter } from "./fs/fileWriter.js";
+import { FileWatcher } from "./fs/watcher.js";
+import { SourcemapGenerator } from "./sourcemap/generator.js";
+import { log } from "./util/log.js";
+import { config, initializeConfig } from "./config.js";
+/**
+ * Main orchestrator for the Azul daemon
+ */
+export class SyncDaemon {
+    ipc;
+    httpServer;
+    tree;
+    fileWriter;
+    fileWatcher;
+    sourcemapGenerator;
+    batchDepth = 0; // Tracks nested batch processing
+    batchNeedsSourcemapRegen = false; // Defer regen until batch ends
+    stopPromise = null;
+    constructor() {
+        this.tree = new TreeManager();
+        this.fileWriter = new FileWriter(config.syncDir);
+        this.fileWatcher = new FileWatcher();
+        this.sourcemapGenerator = new SourcemapGenerator();
+        // HTTP server is used for WebSocket upgrade handling.
+        this.httpServer = http.createServer((_, res) => {
+            res.writeHead(404);
+            res.end("Not found");
+        });
+        this.ipc = new IPCServer(config.port, this.httpServer, {
+            requestSnapshotOnConnect: false,
+        });
+        this.setupHandlers();
+        this.httpServer.listen(config.port);
+    }
+    /**
+     * Set up all event handlers
+     */
+    setupHandlers() {
+        // Handle messages from Studio (WebSocket)
+        this.ipc.onMessage((message) => this.handleStudioMessage(message));
+        this.ipc.onHandshake(() => {
+            this.ipc.requestSnapshot();
+        });
+        // Handle file changes from filesystem
+        this.fileWatcher.onChange((filePath, source) => {
+            this.handleFileChange(filePath, source);
+        });
+    }
+    /**
+     * Handle incoming messages from Studio
+     */
+    handleStudioMessage(message) {
+        if (message.type === "batch") {
+            this.batchDepth += 1;
+            try {
+                for (const payload of message.messages) {
+                    this.handleStudioMessage(payload);
+                }
+            }
+            finally {
+                this.batchDepth -= 1;
+                // If any delete in this batch missed its prune, only regenerate once at the end
+                if (this.batchDepth === 0 && this.batchNeedsSourcemapRegen) {
+                    this.regenerateSourcemap();
+                    this.batchNeedsSourcemapRegen = false;
+                }
+            }
+            return;
+        }
+        switch (message.type) {
+            case "fullSnapshot":
+                this.handleFullSnapshot(message.data);
+                break;
+            case "scriptChanged":
+                this.handleScriptChanged(message.data);
+                break;
+            case "instanceUpdated":
+                this.handleInstanceUpdated(message.data);
+                break;
+            case "deleted":
+                this.handleDeleted(message.data);
+                break;
+            case "ping":
+                this.ipc.send({ type: "pong" });
+                break;
+            case "clientDisconnect":
+                log.info("Studio requested daemon shutdown");
+                void (async () => {
+                    await this.stop();
+                    process.exit(0);
+                })();
+                break;
+            default:
+                log.warn("Unknown message type:", message.type);
+        }
+    }
+    /**
+     * Handle full snapshot from Studio
+     */
+    handleFullSnapshot(data) {
+        log.info("Received full snapshot from Studio");
+        // Update tree
+        this.tree.applyFullSnapshot(data);
+        // Write all scripts to filesystem
+        this.fileWriter.writeTree(this.tree.getAllNodes());
+        // Remove any pre-existing files that are no longer mapped (optional)
+        this.cleanupOrphanFiles();
+        // Start file watching
+        this.fileWatcher.watch(this.fileWriter.getBaseDir());
+        // Generate sourcemap
+        this.regenerateSourcemap();
+        // Log statistics
+        const stats = this.tree.getStats();
+        log.success(`Sync complete: ${stats.scriptNodes} scripts, ${stats.totalNodes} total nodes`);
+    }
+    /**
+     * Handle script source change
+     */
+    handleScriptChanged(message) {
+        const { guid, source, path: instancePath, className } = message;
+        // Update tree
+        this.tree.updateScriptSource(guid, source);
+        // Get or create node
+        let node = this.tree.getNode(guid);
+        if (!node) {
+            // Create new node if it doesn't exist
+            this.tree.updateInstance({
+                guid,
+                className,
+                name: instancePath[instancePath.length - 1],
+                path: instancePath,
+                source,
+            });
+            node = this.tree.getNode(guid);
+        }
+        if (node) {
+            // Precompute path and suppress watcher before writing to avoid race conditions
+            const filePath = this.fileWriter.getFilePath(node);
+            this.fileWatcher.suppressNextChange(filePath, source);
+            // Write to filesystem
+            this.fileWriter.writeScript(node);
+            // Incrementally update sourcemap entry for this script
+            this.sourcemapGenerator.upsertSubtree(node, this.tree.getAllNodes(), this.fileWriter.getAllMappings(), config.sourcemapPath, undefined, false);
+        }
+    }
+    /**
+     * Handle instance update (rename, move, etc.)
+     */
+    handleInstanceUpdated(data) {
+        const update = this.tree.updateInstance(data);
+        const node = update?.node;
+        if (!node) {
+            return;
+        }
+        const scriptsToUpdate = new Map();
+        if (this.isScriptClass(node.className)) {
+            scriptsToUpdate.set(node.guid, node);
+        }
+        if (update.pathChanged || update.nameChanged || update.parentChanged) {
+            for (const child of this.tree.getDescendantScripts(node.guid)) {
+                scriptsToUpdate.set(child.guid, child);
+            }
+        }
+        for (const scriptNode of scriptsToUpdate.values()) {
+            const filePath = this.fileWriter.getFilePath(scriptNode);
+            this.fileWatcher.suppressNextChange(filePath, scriptNode.source);
+            this.fileWriter.writeScript(scriptNode);
+        }
+        const shouldUpdateSourcemap = update.isNew ||
+            update.pathChanged ||
+            update.nameChanged ||
+            update.parentChanged ||
+            this.isScriptClass(node.className);
+        if (shouldUpdateSourcemap) {
+            this.sourcemapGenerator.upsertSubtree(node, this.tree.getAllNodes(), this.fileWriter.getAllMappings(), config.sourcemapPath, update.prevPath, update.isNew);
+        }
+        this.fileWriter.cleanupEmptyDirectories();
+    }
+    /**
+     * Handle instance deletion
+     */
+    handleDeleted(message) {
+        const { guid } = message;
+        const node = this.tree.getNode(guid);
+        // If the node is already gone (e.g., child deletes after parent delete), fall back to full cleanup
+        if (!node) {
+            log.debug(`Delete ignored for unknown guid: ${guid}`);
+            this.fileWriter.deleteScript(guid);
+            // this.regenerateSourcemap();
+            this.fileWriter.cleanupEmptyDirectories();
+            return;
+        }
+        // Capture all script descendants (and the node itself if script) before we delete the tree nodes
+        const scriptsToDelete = [];
+        const collectScript = (scriptNode) => {
+            const filePath = this.fileWriter.getFilePath(scriptNode);
+            scriptsToDelete.push({ guid: scriptNode.guid, filePath });
+        };
+        if (this.isScriptClass(node.className)) {
+            collectScript(node);
+        }
+        for (const child of this.tree.getDescendantScripts(node.guid)) {
+            collectScript(child);
+        }
+        const pathSegments = node.path;
+        // Delete from tree (removes node and descendants)
+        this.tree.deleteInstance(guid);
+        // Delete files for all affected scripts
+        for (const entry of scriptsToDelete) {
+            const removed = this.fileWriter.deleteScript(entry.guid);
+            if (!removed && entry.filePath) {
+                this.fileWriter.deleteFilePath(entry.filePath);
+            }
+        }
+        // Remove subtree from sourcemap
+        const outputPath = config.sourcemapPath;
+        const pruned = this.sourcemapGenerator.prunePath(pathSegments, outputPath, this.tree.getAllNodes(), this.fileWriter.getAllMappings(), node.className, node.guid);
+        // If prune failed to find the path (e.g., sourcemap drift), rebuild once to stay consistent
+        if (!pruned) {
+            if (this.batchDepth > 0) {
+                // Defer regeneration until the batch completes to avoid repeated full rebuilds
+                this.batchNeedsSourcemapRegen = true;
+                log.debug("Regenerating sourcemap after batched prune miss");
+            }
+            else {
+                log.debug("Regenerating sourcemap due to prune miss");
+                this.regenerateSourcemap();
+            }
+        }
+        if (node.parentGuid) {
+            const siblingScriptNodes = this.tree.getDescendantScripts(node.parentGuid);
+            const sameNameScriptNodes = siblingScriptNodes.filter(sibling => sibling.parent?.guid === node.parentGuid && sibling.name === node.name);
+            for (const scriptToRename of sameNameScriptNodes) {
+                if (scriptToRename.path.length !== 0) {
+                    const newFilePath = this.fileWriter.getFilePath(scriptToRename);
+                    // Write new path
+                    this.fileWatcher.suppressNextChange(newFilePath, scriptToRename.source);
+                    this.fileWriter.writeScript(scriptToRename);
+                    // Upsert the subtree into the sourcemap
+                    this.sourcemapGenerator.upsertSubtree(scriptToRename, this.tree.getAllNodes(), this.fileWriter.getAllMappings(), config.sourcemapPath, undefined, false);
+                }
+            }
+        }
+        this.fileWriter.cleanupEmptyDirectories();
+    }
+    /**
+     * Handle file change from filesystem
+     */
+    handleFileChange(filePath, source) {
+        // Find the GUID for this file
+        const guid = this.fileWriter.getGuidByPath(filePath);
+        if (guid) {
+            log.info(`File changed externally: ${path.relative(this.fileWriter.getBaseDir(), filePath)}`);
+            // Same-source anti-echo should be handled in watcher.ts, this is just in case
+            const node = this.tree.getNode(guid);
+            if (node?.source === source) {
+                log.debug(`Skipping Studio patch for unchanged file: ${path.relative(this.fileWriter.getBaseDir(), filePath)}.`);
+                return;
+            }
+            // Update tree
+            this.tree.updateScriptSource(guid, source);
+            // Send patch to Studio (WebSocket client)
+            this.ipc.patchScript(guid, source);
+        }
+        else {
+            log.warn(`No mapping found for file: ${filePath}`);
+        }
+    }
+    /**
+     * Regenerate the sourcemap
+     */
+    regenerateSourcemap() {
+        // Write sourcemap into the sync directory so Luau-LSP can find it
+        const outputPath = config.sourcemapPath;
+        this.sourcemapGenerator.generateAndWrite(this.tree.getAllNodes(), this.fileWriter.getAllMappings(), outputPath);
+    }
+    /**
+     * Start the daemon
+     */
+    start() {
+        log.info("🚀 Azul daemon starting...");
+        log.info(`Sync directory: ${config.syncDir}`);
+        log.info(`HTTP/WebSocket port: ${config.port}`);
+        log.info("");
+        log.success(`Server listening on http://localhost:${config.port}`);
+        log.info("Waiting for Studio connection...");
+    }
+    /**
+     * Stop the daemon
+     */
+    async stop() {
+        if (this.stopPromise) {
+            return this.stopPromise;
+        }
+        this.stopPromise = (async () => {
+            log.info("Stopping daemon...");
+            await this.fileWatcher.stop();
+            this.ipc.send({ type: "daemonDisconnect" });
+            await new Promise((resolve) => setTimeout(resolve, 50));
+            this.ipc.close();
+            await new Promise((resolve, reject) => {
+                this.httpServer.close((error) => {
+                    if (error) {
+                        reject(error);
+                        return;
+                    }
+                    resolve();
+                });
+            });
+            log.info("Daemon stopped");
+        })();
+        return this.stopPromise;
+    }
+    isScriptClass(className) {
+        return (className === "Script" ||
+            className === "LocalScript" ||
+            className === "ModuleScript");
+    }
+    /**
+     * Delete files under syncDir that are not mapped to any instance (opt-in).
+     */
+    cleanupOrphanFiles() {
+        if (!config.deleteOrphansOnConnect) {
+            return;
+        }
+        const baseDir = this.fileWriter.getBaseDir();
+        const mapped = new Set();
+        for (const mapping of this.fileWriter.getAllMappings().values()) {
+            mapped.add(path.resolve(mapping.filePath));
+        }
+        let removedFiles = [];
+        const walk = (dir) => {
+            if (!fs.existsSync(dir))
+                return;
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const entry of entries) {
+                const fullPath = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    walk(fullPath);
+                }
+                else {
+                    if (!mapped.has(path.resolve(fullPath))) {
+                        try {
+                            fs.unlinkSync(fullPath);
+                            removedFiles.push(entry.name);
+                        }
+                        catch (error) {
+                            log.warn("Failed to delete orphan file:", fullPath, error);
+                        }
+                    }
+                }
+            }
+        };
+        walk(baseDir);
+        if (removedFiles.length > 0) {
+            this.fileWriter.cleanupEmptyDirectories();
+            log.success(`Removed ${removedFiles.length} orphan file(s) from sync directory (${removedFiles.join(", ")})`);
+        }
+    }
+}
+// Allow direct execution (`node dist/index.js`) while preventing side effects when imported by the CLI
+const isDirectRun = process.argv[1] &&
+    fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (isDirectRun) {
+    initializeConfig();
+    const daemon = new SyncDaemon();
+    daemon.start();
+    // Handle graceful shutdown
+    process.on("SIGINT", async () => {
+        console.log("\n");
+        console.log("Received SIGINT, shutting down...");
+        await daemon.stop();
+        process.exit(0);
+    });
+    process.on("SIGTERM", async () => {
+        await daemon.stop();
+        process.exit(0);
+    });
+}
+//# sourceMappingURL=index.js.map

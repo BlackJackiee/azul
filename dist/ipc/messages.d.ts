@@ -1,0 +1,124 @@
+/**
+ * Types for communication protocol between Studio and Daemon
+ */
+export type InstanceClassName = "Script" | "LocalScript" | "ModuleScript" | "Folder" | "Model" | "Part" | "MeshPart" | "Tool" | "Configuration" | string;
+/**
+ * Represents a single instance in the DataModel
+ */
+export interface InstanceData {
+    guid: string;
+    className: InstanceClassName;
+    name: string;
+    path: string[];
+    parentGuid?: string | null;
+    source?: string;
+    properties?: Record<string, unknown>;
+    attributes?: Record<string, unknown>;
+    tags?: string[];
+}
+export interface SnapshotRequestOptions {
+    includeProperties?: boolean;
+    scriptsAndDescendantsOnly?: boolean;
+}
+/**
+ * Messages from Studio → Daemon
+ */
+export type StudioPayloadMessage = FullSnapshotMessage | InstanceUpdatedMessage | ScriptChangedMessage | DeletedMessage | PingMessage | ClientDisconnect | PushConfigMessage | HandshakeMessageStudio;
+export interface BatchMessage {
+    type: "batch";
+    messages: StudioPayloadMessage[];
+}
+export type StudioMessage = StudioPayloadMessage | BatchMessage;
+export interface FullSnapshotMessage {
+    type: "fullSnapshot";
+    data: InstanceData[];
+}
+export interface InstanceUpdatedMessage {
+    type: "instanceUpdated";
+    data: InstanceData;
+}
+export interface ScriptChangedMessage {
+    type: "scriptChanged";
+    data: {
+        guid: string;
+        path: string[];
+        className: InstanceClassName;
+        source: string;
+    };
+}
+export interface DeletedMessage {
+    type: "deleted";
+    data: {
+        guid: string;
+    };
+}
+export interface PingMessage {
+    type: "ping";
+}
+export interface ClientDisconnect {
+    type: "clientDisconnect";
+}
+export interface PushConfigMessage {
+    type: "pushConfig";
+    config: PushConfig;
+}
+export interface HandshakeAckMessage {
+    type: "handshakeAck";
+}
+export interface HandshakeMessageStudio {
+    type: "handshakeStudio";
+}
+/**
+ * Messages from Daemon → Studio
+ */
+export type DaemonMessage = PatchScriptMessage | RequestSnapshotMessage | PongMessage | DaemonDisconnectMessage | ErrorMessage | BuildSnapshotMessage | RequestPushConfigMessage | PushSnapshotMessage | HandshakeAckMessage;
+export interface PatchScriptMessage {
+    type: "patchScript";
+    guid: string;
+    source: string;
+}
+export interface RequestSnapshotMessage {
+    type: "requestSnapshot";
+    options?: SnapshotRequestOptions;
+}
+export interface PongMessage {
+    type: "pong";
+}
+export interface DaemonDisconnectMessage {
+    type: "daemonDisconnect";
+}
+export interface ErrorMessage {
+    type: "error";
+    message: string;
+}
+export interface BuildSnapshotMessage {
+    type: "buildSnapshot";
+    data: InstanceData[];
+    destructive?: boolean;
+}
+export interface RequestPushConfigMessage {
+    type: "requestPushConfig";
+}
+export interface PushSnapshotMessage {
+    type: "pushSnapshot";
+    mappings: PushSnapshotMapping[];
+}
+export interface PushSnapshotMapping {
+    destination: string[];
+    destructive?: boolean;
+    instances: InstanceData[];
+}
+export interface PushConfig {
+    mappings: PushConfigMapping[];
+    port?: number;
+    debugMode?: boolean;
+    deleteOrphansOnConnect?: boolean;
+}
+export interface PushConfigMapping {
+    source: string;
+    destination: string[];
+    destructive?: boolean;
+    rojoMode?: boolean;
+    fromSourcemap?: string;
+}
+//# sourceMappingURL=messages.d.ts.map
